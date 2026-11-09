@@ -155,6 +155,7 @@ jobs:
       run: mkdir -p logs
 
     - name: Run WeRead Bot
+      id: read
       env:
         # Cookie刷新QL属性，根据不同用户的环境，可能需要设置为True或False来确保cookie刷新正常工作，默认值为false
         HACK_COOKIE_REFRESH_QL: ${{ secrets.HACK_COOKIE_REFRESH_QL }}
@@ -167,7 +168,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
-        APPRISE_URL: ${{ secrets.APPRISE_URL }}
+        # 邮件（Apprise）通知改由下方 "Send email notification" 步骤统一发送
         BARK_SERVER: ${{ secrets.BARK_SERVER }}
         BARK_DEVICE_KEY: ${{ secrets.BARK_DEVICE_KEY }}
         BARK_SOUND: ${{ secrets.BARK_SOUND }}
@@ -225,3 +226,184 @@ jobs:
           logs/run-history.json
         if-no-files-found: warn
         retention-days: 7
+
+    - name: Send email notification
+      if: always()
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        APPRISE_URL: ${{ secrets.APPRISE_URL }}
+        READ_OUTCOME: ${{ steps.read.outcome }}
+        NOTIFY_ENABLED: ${{ secrets.NOTIFICATION_ENABLED || github.event.inputs.notify_enabled || 'true' }}
+        NOTIFY_ONLY_ON_FAILURE: ${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || github.event.inputs.notify_only_on_failure || 'false' }}
+      run: |
+        is_false() {
+          case "$1" in
+            [fF][aA][lL][sS][eE]|0|[nN][oO]|[oO][fF][fF]) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        if [ -z "$APPRISE_URL" ]; then
+          echo "未配置 APPRISE_URL，跳过邮件通知"
+          exit 0
+        fi
+        if is_false "$NOTIFY_ENABLED"; then
+          echo "通知已关闭，跳过邮件通知"
+          exit 0
+        fi
+
+        MAIL_DIR=/tmp/weread-mail
+        python3 - <<'PYEOF'
+        import os
+        import pathlib
+        import re
+
+        MIN_SUCCESS_RATE = 75.0
+        DURATION_RATIO = 0.9
+        LOG_PREFIX_RE = re.compile(
+            r"^\d{4}-\d{2}-\d{2} [\d:,]+ - [A-Z]+\s+- \[user=[^\]]*\] - "
+        )
+
+        log_path = pathlib.Path("logs/weread.log")
+        out_dir = pathlib.Path("/tmp/weread-mail")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        title_path = out_dir / "title.txt"
+        body_path = out_dir / "body.txt"
+        for path in (title_path, body_path):
+            path.unlink(missing_ok=True)
+
+        blocks = []
+        current = None
+        if log_path.exists():
+            for raw_line in log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                line = LOG_PREFIX_RE.sub("", raw_line)
+                if "📊 微信读书自动阅读统计报告" in line:
+                    current = [line]
+                    continue
+                if current is not None:
+                    current.append(line)
+                    if "🎉 本次阅读任务完成" in line:
+                        blocks.append("\n".join(current).strip())
+                        current = None
+            # 日志被截断时仍保留残缺报告，交由 evaluate 标记为未达标
+            if current is not None:
+                blocks.append("\n".join(current).strip())
+
+        def evaluate(block):
+            result = {"reasons": []}
+            user_match = re.search(r"用户名称: *(.*)", block)
+            result["user"] = (
+                user_match.group(1).strip() if user_match else "未知用户"
+            )
+            rate_match = re.search(r"成功率: ([\d.]+)%", block)
+            actual_match = re.search(r"实际阅读: (\d+)分(\d+)秒", block)
+            target_match = re.search(r"目标时长: ([\d.]+)分钟", block)
+
+            result["rate"] = None
+            if rate_match:
+                result["rate"] = float(rate_match.group(1))
+
+            if "🎉 本次阅读任务完成" not in block:
+                result["reasons"].append("缺少完成标记")
+            if result["rate"] is None:
+                result["reasons"].append("未找到成功率")
+            elif result["rate"] < MIN_SUCCESS_RATE:
+                result["reasons"].append(
+                    f"成功率 {result['rate']:.1f}% < {MIN_SUCCESS_RATE:g}%"
+                )
+
+            if not actual_match or not target_match:
+                result["reasons"].append("未找到阅读时长")
+                return result
+
+            actual_seconds = (
+                int(actual_match.group(1)) * 60 + int(actual_match.group(2))
+            )
+            target_minutes = float(target_match.group(1))
+            if actual_seconds < target_minutes * 60 * DURATION_RATIO:
+                result["reasons"].append(
+                    f"实际阅读 {actual_seconds // 60}分"
+                    f"{actual_seconds % 60}秒 < 目标 {target_minutes:g}"
+                    f"分钟的 {DURATION_RATIO * 100:g}%"
+                )
+            return result
+
+        results = [evaluate(block) for block in blocks]
+        failure_reasons = []
+        outcome = os.environ.get("READ_OUTCOME", "").strip()
+        if outcome != "success":
+            failure_reasons.append(f"运行结果 {outcome or 'unknown'}")
+        if not blocks:
+            failure_reasons.append("日志中未找到阅读统计报告")
+        for result in results:
+            for reason in result["reasons"]:
+                failure_reasons.append(f"{result['user']}：{reason}")
+
+        ok = not failure_reasons
+
+        only_on_failure = os.environ.get(
+            "NOTIFY_ONLY_ON_FAILURE", "false"
+        ).strip().lower()
+        if only_on_failure in {"true", "1", "yes", "on"} and ok:
+            print("仅失败时通知：本次结果达标，跳过邮件通知")
+            raise SystemExit(0)
+
+        server_url = os.environ.get("GITHUB_SERVER_URL", "")
+        repository = os.environ.get("GITHUB_REPOSITORY", "")
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+        run_url = (
+            f"{server_url}/{repository}/actions/runs/{run_id}"
+            if server_url and repository and run_id else "（未提供）"
+        )
+
+        rates = [result["rate"] for result in results if result["rate"] is not None]
+        passed = sum(1 for result in results if not result["reasons"])
+
+        lines = [
+            f"结果：{'✅ 全部达标' if ok else '❌ 未达标'}",
+            f"达标用户：{passed}/{len(results)}",
+        ]
+        if rates:
+            lines.append(f"最低成功率：{min(rates):.1f}%")
+        lines.append(f"运行记录：{run_url}")
+        if not ok:
+            lines.append("")
+            lines.append("未达标原因：")
+            lines.extend(f"- {reason}" for reason in failure_reasons)
+        lines.append("")
+        lines.append("—— 阅读统计 ——")
+        if blocks:
+            for block in blocks:
+                lines.extend(["", block])
+        else:
+            lines.extend(["", "（无可用统计报告，请查看 workflow 日志）"])
+        lines.extend([
+            "",
+            "—— 判定标准 ——",
+            f"成功率 ≥ {MIN_SUCCESS_RATE:g}%，"
+            f"实际阅读 ≥ 目标时长的 {DURATION_RATIO:g} 倍，且运行结果成功",
+        ])
+
+        title_path.write_text(
+            f"{'✅' if ok else '❌'} 微信读书自动阅读报告", encoding="utf-8"
+        )
+        body_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"邮件判定：{'成功' if ok else '失败'}，统计报告 {len(blocks)} 份")
+        PYEOF
+
+        if [ ! -f "$MAIL_DIR/title.txt" ]; then
+          exit 0
+        fi
+
+        # Apprise CLI 从环境变量读取 URL，不写文件或将 URL 放到命令参数。
+        export APPRISE_URLS="$APPRISE_URL"
+        if apprise --title "$(cat "$MAIL_DIR/title.txt")" \
+            --body "$(cat "$MAIL_DIR/body.txt")" >/dev/null 2>&1; then
+          echo "邮件通知已发送"
+        else
+          echo "邮件通知发送失败（通知 URL 和原始错误已隐藏）"
+          exit 1
+        fi
